@@ -1,0 +1,502 @@
+"""Tuya blind controller quirk for _TZE284_libht6ua TS0601 - Enhanced ZCL Integration."""
+import logging
+from typing import Any, Dict
+
+from zigpy.profiles import zha
+from zigpy.zcl import foundation
+from zigpy.zcl.clusters.closures import WindowCovering
+from zigpy.zcl.clusters.general import Basic, Groups, Ota, Scenes, Time
+
+from zhaquirks.const import (
+    DEVICE_TYPE,
+    ENDPOINTS,
+    INPUT_CLUSTERS,
+    MODELS_INFO,
+    OUTPUT_CLUSTERS,
+    PROFILE_ID,
+)
+from zhaquirks.tuya import (
+    TuyaWindowCover,
+    TuyaManufacturerWindowCover,
+    TuyaWindowCoverControl,
+    TuyaPowerConfigurationCluster,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class TuyaBlindControllerManufCluster(TuyaManufacturerWindowCover):
+    """Enhanced manufacturer cluster that coordinates with ZCL attributes."""
+    
+    def __init__(self, *args, **kwargs):
+        """Initialize the manufacturer cluster."""
+        super().__init__(*args, **kwargs)
+        self._last_stable_position = None
+        self._position_samples = []
+        self._ignore_until = 0
+        self._calibration_mode = False
+        self._known_data_points = {}
+        
+    async def bind(self):
+        """Bind and set up initial configuration."""
+        result = await super().bind()
+        
+        # Try to read the current ZCL position attributes
+        try:
+            window_covering = self.endpoint.window_covering
+            if window_covering:
+                # Read current position from ZCL attributes
+                current_pos = await window_covering.read_attributes(['current_position_lift_percentage'])
+                if current_pos and 'current_position_lift_percentage' in current_pos[0]:
+                    pos_value = current_pos[0]['current_position_lift_percentage']
+                    if pos_value is not None and 0 <= pos_value <= 100:
+                        self._last_stable_position = pos_value
+                        _LOGGER.info("Initial position read from ZCL: %s%%", pos_value)
+        except Exception as e:
+            _LOGGER.debug("Could not read initial ZCL position: %s", e)
+            
+        return result
+    
+    async def command(
+        self,
+        command_id: int,
+        *args,
+        manufacturer: int | None = None,
+        expect_reply: bool = True,
+        tsn: int | None = None,
+        **kwargs,
+    ):
+        """Override command to manage position reporting during movements."""
+        _LOGGER.debug("TUYA COMMAND - ID: 0x%04x, Args: %s", command_id, args)
+        
+        # Reset position tracking when new commands are sent
+        import time
+        self._ignore_until = time.time() + 1.0  # Ignore position updates for 1 second
+        self._position_samples.clear()
+        
+        return await super().command(command_id, *args, manufacturer=manufacturer, 
+                                   expect_reply=expect_reply, tsn=tsn, **kwargs)
+    
+    def handle_cluster_request(
+        self,
+        hdr: foundation.ZCLHeader,
+        args,
+        *,
+        dst_addressing=None,
+    ) -> None:
+        """Handle cluster request with improved position validation and DP discovery."""
+        if hdr.command_id in (0x0001, 0x0002):  # GET_DATA, SET_DATA_RESPONSE
+            if not args or args[0] is None:
+                _LOGGER.debug("Received empty or None payload")
+                super().handle_cluster_request(hdr, args, dst_addressing=dst_addressing)
+                return
+                
+            tuya_payload = args[0]
+            if not hasattr(tuya_payload, 'command_id'):
+                _LOGGER.debug("Payload missing command_id attribute")
+                super().handle_cluster_request(hdr, args, dst_addressing=dst_addressing)
+                return
+                
+            dp_num = tuya_payload.command_id & 0xFF
+            
+            # Store all data points we see for calibration discovery
+            self._known_data_points[dp_num] = {
+                'data': list(tuya_payload.data) if tuya_payload.data else [],
+                'function': tuya_payload.function,
+                'last_seen': __import__('time').time()
+            }
+            
+            _LOGGER.warning("TUYA DP %s: %s (func: %s)", dp_num, 
+                          list(tuya_payload.data) if tuya_payload.data else "None",
+                          tuya_payload.function)
+            
+            # Handle known data points
+            if dp_num == 3 and len(tuya_payload.data) >= 5:
+                self._handle_position_update(tuya_payload.data[4])
+                    
+            elif dp_num == 12 and len(tuya_payload.data) >= 2:
+                battery_status = tuya_payload.data[1]
+                _LOGGER.debug("Battery status: %s", "Good" if battery_status == 0 else "Low")
+                
+            elif dp_num == 13 and len(tuya_payload.data) >= 5:
+                battery_percent = tuya_payload.data[4]
+                _LOGGER.debug("Battery: %s%%", battery_percent)
+                
+                if 0 <= battery_percent <= 100:
+                    power_cluster = getattr(self.endpoint, "power", None)
+                    if power_cluster:
+                        zcl_battery = min(battery_percent * 2, 200)
+                        power_cluster._update_attribute(
+                            power_cluster.attributes_by_name["battery_percentage_remaining"].id,
+                            zcl_battery
+                        )
+            
+            # Try to identify calibration data points
+            elif dp_num in range(5, 16):  # Common range for calibration DPs
+                self._analyze_calibration_dp(dp_num, tuya_payload.data)
+        
+        # Call the parent handler
+        super().handle_cluster_request(hdr, args, dst_addressing=dst_addressing)
+    
+    def _handle_position_update(self, raw_position: int):
+        """Handle position updates with smart filtering."""
+        import time
+        current_time = time.time()
+        
+        # Ignore updates during command processing
+        if current_time < self._ignore_until:
+            _LOGGER.debug("Position ignored (command cooldown): %s", raw_position)
+            return
+            
+        # Validate position range
+        if not (0 <= raw_position <= 100):
+            _LOGGER.debug("Position ignored (invalid range): %s", raw_position)
+            return
+        
+        # Collect position samples for stability checking
+        self._position_samples.append((current_time, raw_position))
+        
+        # Keep only recent samples (last 3 seconds)
+        self._position_samples = [(t, p) for t, p in self._position_samples if current_time - t < 3.0]
+        
+        # Need at least 2 samples to check stability
+        if len(self._position_samples) < 2:
+            return
+            
+        # Check if position has stabilized
+        recent_positions = [p for t, p in self._position_samples if current_time - t < 1.0]
+        
+        if len(recent_positions) >= 2:
+            # Position is stable if recent readings are consistent
+            pos_range = max(recent_positions) - min(recent_positions)
+            if pos_range <= 2:  # Within 2% tolerance
+                stable_position = int(sum(recent_positions) / len(recent_positions))
+                
+                # Only update if position has actually changed
+                if self._last_stable_position is None or abs(stable_position - self._last_stable_position) >= 2:
+                    self._update_position(stable_position)
+                    self._last_stable_position = stable_position
+                    # Clear samples after successful update
+                    self._position_samples.clear()
+                    
+    def _analyze_calibration_dp(self, dp_num: int, data):
+        """Analyze data points that might be calibration-related."""
+        if not data:
+            return
+            
+        data_len = len(data)
+        _LOGGER.warning("POTENTIAL CALIBRATION DP %s: len=%s, data=%s", dp_num, data_len, list(data))
+        
+        # Look for patterns that suggest calibration parameters
+        if data_len >= 5 and data[0] == 0x02:  # Type 2 usually means value
+            value = data[4] if data_len > 4 else None
+            if value is not None:
+                # Common calibration values
+                if 1 <= value <= 255:  # Could be motor speed
+                    _LOGGER.warning("DP %s might be MOTOR_SPEED: %s", dp_num, value)
+                elif 5 <= value <= 120:  # Could be calibration time (seconds)
+                    _LOGGER.warning("DP %s might be CALIBRATION_TIME: %s seconds", dp_num, value)
+                elif value in [0, 1]:  # Could be direction or boolean setting
+                    _LOGGER.warning("DP %s might be DIRECTION/BOOLEAN: %s", dp_num, value)
+    
+    async def set_calibration_time(self, seconds: int):
+        """Attempt to set calibration time via various DPs."""
+        if not (5 <= seconds <= 120):
+            _LOGGER.error("Calibration time must be between 5-120 seconds")
+            return foundation.Status.INVALID_VALUE
+            
+        # Try common data points for calibration time
+        for dp_candidate in [7, 8, 9, 10]:
+            try:
+                _LOGGER.warning("Trying to set calibration time via DP %s to %s seconds", dp_candidate, seconds)
+                await self.tuya_mcu_command(dp_candidate, seconds, expect_reply=False)
+                await __import__('asyncio').sleep(0.5)  # Small delay between attempts
+            except Exception as e:
+                _LOGGER.debug("Failed to set calibration via DP %s: %s", dp_candidate, e)
+        
+        return foundation.Status.SUCCESS
+    
+    async def set_motor_speed(self, speed: int):
+        """Attempt to set motor speed via various DPs."""
+        if not (1 <= speed <= 255):
+            _LOGGER.error("Motor speed must be between 1-255")
+            return foundation.Status.INVALID_VALUE
+            
+        # Try common data points for motor speed
+        for dp_candidate in [5, 6, 14, 15]:
+            try:
+                _LOGGER.warning("Trying to set motor speed via DP %s to %s", dp_candidate, speed)
+                await self.tuya_mcu_command(dp_candidate, speed, expect_reply=False)
+                await __import__('asyncio').sleep(0.5)
+            except Exception as e:
+                _LOGGER.debug("Failed to set motor speed via DP %s: %s", dp_candidate, e)
+        
+        return foundation.Status.SUCCESS
+    
+    async def trigger_calibration(self):
+        """Attempt to trigger calibration mode."""
+        _LOGGER.warning("Attempting to trigger calibration mode...")
+        
+        # Try common calibration trigger commands
+        calibration_commands = [
+            (16, 1),   # DP 16, value 1
+            (17, 1),   # DP 17, value 1  
+            (18, 1),   # DP 18, value 1
+            (101, 1),  # DP 101, value 1 (some devices use high DPs)
+        ]
+        
+        for dp, value in calibration_commands:
+            try:
+                _LOGGER.warning("Trying calibration trigger: DP %s = %s", dp, value)
+                await self.tuya_mcu_command(dp, value, expect_reply=False)
+                await __import__('asyncio').sleep(1.0)
+            except Exception as e:
+                _LOGGER.debug("Calibration trigger DP %s failed: %s", dp, e)
+        
+        return foundation.Status.SUCCESS
+    
+    def _update_position(self, position: int):
+        """Update the ZCL position attribute."""
+        try:
+            cover_cluster = getattr(self.endpoint, "window_covering", None)
+            if cover_cluster:
+                # Update the ZCL attribute
+                cover_cluster._update_attribute(
+                    WindowCovering.AttributeDefs.current_position_lift_percentage.id, 
+                    position
+                )
+                _LOGGER.info("Position updated to %s%%", position)
+        except Exception as e:
+            _LOGGER.error("Failed to update position: %s", e)
+    
+    def get_discovered_data_points(self):
+        """Return all discovered data points for analysis."""
+        return self._known_data_points.copy()
+
+
+class TuyaBlindWindowCoveringCluster(TuyaWindowCoverControl):
+    """Enhanced window covering cluster with ZCL attribute management."""
+
+    _CONSTANT_ATTRIBUTES = {
+        WindowCovering.AttributeDefs.window_covering_type.id: WindowCovering.WindowCoveringType.Rollershade,
+        WindowCovering.AttributeDefs.config_status.id: 0x03,
+        WindowCovering.AttributeDefs.physical_closed_limit_lift.id: 65535,
+        WindowCovering.AttributeDefs.installed_closed_limit_lift.id: 65535,
+    }
+    
+    async def bind(self):
+        """Set up the cluster with proper attribute initialization."""
+        result = await super().bind()
+        
+        # Initialize position attributes
+        try:
+            # Set default position if not already set
+            current_pos = self._attr_cache.get(WindowCovering.AttributeDefs.current_position_lift_percentage.id)
+            if current_pos is None:
+                self._update_attribute(WindowCovering.AttributeDefs.current_position_lift_percentage.id, 50)
+                _LOGGER.info("Initialized position to 50%")
+        except Exception as e:
+            _LOGGER.debug("Could not initialize position attributes: %s", e)
+            
+        return result
+    
+    async def command(
+        self,
+        command_id: int,
+        *args,
+        manufacturer: int | None = None,
+        expect_reply: bool = True,
+        tsn: int | None = None,
+        **kwargs,
+    ):
+        """Enhanced command handling with position prediction."""
+        command_name = {
+            0x00: "UP_OPEN",
+            0x01: "DOWN_CLOSE", 
+            0x02: "STOP"
+        }.get(command_id, f"UNKNOWN_0x{command_id:02x}")
+        
+        _LOGGER.info("Window covering command: %s", command_name)
+        
+        # Predict position changes for immediate UI feedback
+        if command_id in (0x00, 0x01):  # UP or DOWN
+            try:
+                current_pos = self._attr_cache.get(WindowCovering.AttributeDefs.current_position_lift_percentage.id, 50)
+                if command_id == 0x00:  # UP/OPEN
+                    predicted_pos = max(0, current_pos - 10)  # Estimate 10% movement
+                else:  # DOWN/CLOSE
+                    predicted_pos = min(100, current_pos + 10)
+                
+                # Temporarily update position for immediate feedback
+                self._update_attribute(WindowCovering.AttributeDefs.current_position_lift_percentage.id, predicted_pos)
+                _LOGGER.debug("Predicted position: %s%%", predicted_pos)
+            except Exception as e:
+                _LOGGER.debug("Could not predict position: %s", e)
+        
+        return await super().command(command_id, *args, manufacturer=manufacturer,
+                                   expect_reply=expect_reply, tsn=tsn, **kwargs)
+    
+    async def read_attributes(self, attributes, *args, **kwargs):
+        """Enhanced attribute reading with fallback values."""
+        result = await super().read_attributes(attributes, *args, **kwargs)
+        
+        # Provide sensible defaults for unsupported attributes
+        if result and isinstance(result, tuple) and len(result) > 0:
+            attr_dict = result[0]
+            for attr_id in attributes:
+                if attr_id not in attr_dict:
+                    # Provide defaults for commonly requested attributes
+                    if attr_id == WindowCovering.AttributeDefs.current_position_lift_percentage.id:
+                        attr_dict[attr_id] = self._attr_cache.get(attr_id, 50)
+                    elif attr_id == WindowCovering.AttributeDefs.window_covering_type.id:
+                        attr_dict[attr_id] = WindowCovering.WindowCoveringType.Rollershade
+                        
+        return result
+
+
+class TuyaBlindController(TuyaWindowCover):
+    """Enhanced Tuya blind controller with ZCL attribute integration."""
+
+    # Corrected command mapping
+    tuya_cover_command = {
+        0x0000: 0x0002,  # ZCL UP/OPEN -> Tuya STOP (0x02)
+        0x0001: 0x0000,  # ZCL DOWN/CLOSE -> Tuya 0x00
+        0x0002: 0x0001   # ZCL STOP -> Tuya UP (0x01)
+    }
+    
+    tuya_cover_inverted_by_default = False
+
+    def __init__(self, *args, **kwargs):
+        """Initialize with enhanced features."""
+        _LOGGER.info("Enhanced TuyaBlindController initialized for _TZE284_libht6ua")
+        super().__init__(*args, **kwargs)
+
+    signature = {
+        MODELS_INFO: [
+            ("_TZE284_libht6ua", "TS0601"),
+        ],
+        ENDPOINTS: {
+            1: {
+                PROFILE_ID: zha.PROFILE_ID,
+                DEVICE_TYPE: 0x0051,
+                INPUT_CLUSTERS: [
+                    0x0000,  # Basic
+                    0x0004,  # Groups
+                    0x0005,  # Scenes
+                    0xed00,  # Tuya manufacturer cluster
+                    0xef00,  # Additional Tuya cluster
+                ],
+                OUTPUT_CLUSTERS: [
+                    0x000a,  # Time
+                    0x0019,  # OTA
+                ],
+            }
+        },
+    }
+
+    replacement = {
+        ENDPOINTS: {
+            1: {
+                PROFILE_ID: zha.PROFILE_ID,
+                DEVICE_TYPE: zha.DeviceType.WINDOW_COVERING_DEVICE,
+                INPUT_CLUSTERS: [
+                    Basic.cluster_id,
+                    Groups.cluster_id,
+                    Scenes.cluster_id,
+                    TuyaBlindControllerManufCluster,
+                    TuyaBlindWindowCoveringCluster,
+                    TuyaPowerConfigurationCluster,
+                ],
+                OUTPUT_CLUSTERS: [
+                    Time.cluster_id,
+                    Ota.cluster_id,
+                ],
+            }
+        }
+    }
+
+
+_LOGGER.info("Enhanced TuyaBlindController quirk loaded")
+
+# CALIBRATION INSTRUCTIONS:
+# 
+# Since custom ZCL commands aren't working through the standard interface,
+# use the manufacturer cluster directly via Developer Tools:
+#
+# METHOD 1: Using tuya_mcu_command (if available)
+# 1. To set calibration time (30 seconds):
+#    Service: zha.issue_zigbee_cluster_command
+#    Data:
+#      ieee: [your device IEEE address]
+#      endpoint_id: 1
+#      cluster_id: 61184  # 0xef00 - Tuya manufacturer cluster
+#      cluster_type: in
+#      command: tuya_mcu_command
+#      command_type: server
+#      params: 
+#        dp: 7        # DP number (try 7, 8, 9, or 10)
+#        data: 30     # Time in seconds
+#
+# METHOD 2: Using raw Tuya data command (more reliable)
+# 1. To set calibration time via DP 7:
+#    Service: zha.issue_zigbee_cluster_command  
+#    Data:
+#      ieee: [your device IEEE address]
+#      endpoint_id: 1
+#      cluster_id: 61184  # 0xef00 - Tuya manufacturer cluster
+#      cluster_type: in
+#      command: 0  # SET_DATA command
+#      command_type: server
+#      params:
+#        param1: 7    # DP number
+#        param2: 2    # Data type (2 = value)
+#        param3: 30   # Value (calibration time in seconds)
+#
+# 2. To set motor speed via DP 5:
+#      params:
+#        param1: 5    # DP number
+#        param2: 2    # Data type 
+#        param3: 50   # Speed value (1-255)
+#
+# 3. To trigger calibration via DP 16:
+#      params:
+#        param1: 16   # DP number
+#        param2: 1    # Data type (1 = boolean)
+#        param3: 1    # Trigger value
+#
+# METHOD 3: Alternative approach using service calls
+# You can also try calling the manufacturer cluster methods directly:
+#
+# 1. Get discovered data points:
+#    Service: zha.issue_zigbee_cluster_command
+#    Data:
+#      ieee: [your device IEEE address]
+#      endpoint_id: 1  
+#      cluster_id: 61184
+#      cluster_type: in
+#      command: get_discovered_data_points
+#      command_type: server
+#      params: {}
+#
+# 2. Set calibration time:
+#    Service: zha.issue_zigbee_cluster_command
+#    Data:
+#      ieee: [your device IEEE address]
+#      endpoint_id: 1
+#      cluster_id: 61184
+#      cluster_type: in  
+#      command: set_calibration_time
+#      command_type: server
+#      params:
+#        seconds: 30
+#
+# 4. Monitor the Home Assistant logs for "POTENTIAL CALIBRATION DP" messages
+#    to identify which data points your specific device uses.
+#
+# 5. The device may need to be manually moved to full open/close positions
+#    during the calibration process.
+#
+# 6. Try different DP numbers if the first attempts don't work:
+#    - Calibration time: DP 7, 8, 9, 10
+#    - Motor speed: DP 5, 6, 14, 15  
+#    - Calibration trigger: DP 16, 17, 18, 101
